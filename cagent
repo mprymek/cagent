@@ -1,0 +1,337 @@
+#!/usr/bin/env python
+
+"""
+   _____                  _                                _
+  / ____|                | |         /\                   | |
+ | |     _ __ _   _ _ __ | |_ ___   /  \   __ _  ___ _ __ | |_
+ | |    | '__| | | | '_ \| __/ _ \ / /\ \ / _` |/ _ \ '_ \| __|
+ | |____| |  | |_| | |_) | || (_) / ____ \ (_| |  __/ | | | |_
+  \_____|_|   \__, | .__/ \__\___/_/    \_\__, |\___|_| |_|\__|
+               __/ | |                     __/ |
+              |___/|_|                    |___/
+
+                         B - E - T - A !
+              suggestions and patches are welcome
+
+ Convenient one-file {en|de}cryption tool using ssh-agent RSA keys.
+
+ Features:
+  * {en|de}crypt files using ssh-agent-stored keys (you don't have
+       to write any passwords, just hit Enter when ssh-agent asks
+       you to use a key (you use "-c" with ssh-add, don't you?)
+  * ssh-agent can even store your smartcard PIN (see -s in man ssh-add)
+    and use your non-exportable RSA keys
+  * store your encrypted config files on your webserver and conveniently
+    run commands using them while keeping the config-decrypted-time
+    at the bare minimum! (better then ever-mounted encfs or such)
+
+ Cagent uses openssl for AES-256 encryption. Different
+ key is used for every file/run. The key is derived this way:
+
+          key = sha256(ssh_agent_sign(random_salt))
+
+ ssh_agent_sign = salt is signed with the chosen RSA private key
+ kept in your ssh-agent. ssh-agent provides only sign operation,
+ so we must use it instead of a normal RSA encryption.
+
+ For every plaintext file _pfile_ cagent creates two files:
+    pfile.enc - AES256 encrypted pfile
+    pfile.meta - json formatted metadata = salt and RSA key fingerprint
+
+ Note: if you lose your RSA key, there's no way to retrieve the files content!
+       Keep a backup of the key in a secure location.
+
+ Requirements:
+   - working ssh-agent holding at least one key
+   - openssl
+   - python
+   - Paramiko python library (for communication with ssh-agent)
+   - (optional but strongly advised) secure tmp directory
+      - i.e. some directory where you can put your decrypted files
+        temporarily = encrypted partition, ramdisk (with encrypted or
+        disabled swap!) etc.
+"""
+
+# where to put temporary directories
+# in "run" command, DECRYPTED config file will be put here, so
+# this should be SECURE volume - encrypted disk, ramdisk backed by encrypted swap etc.
+privtmp='/tmp'
+# how long to wait before removing temporary dir in "run" command (in seconds)
+rm_wait=2
+# be verbose
+verbose=False
+#verbose=True
+# default credentials for fetching files from http
+http_user=''
+http_password=''
+# file with http credentials ("user:password", NO NEWLINE)
+creds_file='.config/cagent/http-creds.enc'
+# default key fingerprint
+default_key_fp="pu:ty:ou:rk:ey:fi:ng:er:pr:in:th:er:e!:!!:!!:!!"
+
+
+###############################################################################
+# no user-serviceable parts below...
+
+import sys
+import tempfile
+import os.path
+import shutil
+import multiprocessing
+import subprocess
+import time
+import urllib2
+import hashlib
+import paramiko.agent
+import struct
+import base64
+import json
+
+def pwd_256(key_fp,salt):
+  """
+  returns 256bit long password derived from salt and private key with the given fingerprint
+  """
+  a = paramiko.agent.Agent()
+  key=None
+  for k in a.get_keys():
+    fp = k.get_fingerprint()
+    fps = ":".join("{:02x}".format(ord(c)) for c in fp)
+    if fps==key_fp:
+      key=k
+      break
+  if key is None:
+    raise RuntimeError("Key not found")
+
+  if verbose: print "* Key found, signing salt"
+  d = key.sign_ssh_data(None, salt)
+
+  parts = []
+  while d:
+      length = struct.unpack('>I', d[:4])[0]
+      bits = d[4:length+4]
+      parts.append(bits)
+      d = d[length+4:]
+
+  if parts[0]!='ssh-rsa':
+    raise RuntimeError("Bad signature message - expected 'ssh-rsa', got %r"%(parts[0],))
+
+  if len(parts[1])<128:
+    raise RuntimeError("Bad signature length - expected more than 127B, got %s"%(len(parts[1]),))
+
+  return hashlib.sha256(parts[1]).digest()
+
+# gets SECURE tmpdir - we can safely use os.path.join here
+# maketemp is not needed...
+def fetch2_auth(url,tmpdir):
+  """
+  fetch file from authenticated http
+  """
+  credfileenc=os.path.join(os.environ['HOME'],creds_file)
+  user=http_user
+  passwd=http_password
+  if os.path.exists(credfileenc):
+    print "* decrypting http-creds file"
+    credfile=os.path.join(tmpdir,'http-creds')
+    decfile(credfileenc,credfile)
+    f=open(credfile,'r')
+    user,passwd = f.read().split(':')
+    f.close()
+    os.remove(credfile)
+  salturl=url[:-4]+'.meta'
+  mgr = urllib2.HTTPPasswordMgrWithDefaultRealm()
+  mgr.add_password(None, url, user, passwd)
+  mgr.add_password(None, salturl, user, passwd)
+  opener = urllib2.build_opener(urllib2.HTTPBasicAuthHandler(mgr),
+                         urllib2.HTTPDigestAuthHandler(mgr))
+  urllib2.install_opener(opener)
+  fenc = urllib2.urlopen(url)
+  if verbose: print "* Fetching "+url
+  fmeta = urllib2.urlopen(salturl)
+  return fenc,fmeta
+
+def fetch2(url,tmpdir):
+  try:
+    if verbose: print "* Fetching "+url
+    fenc = urllib2.urlopen(url)
+    metaurl = url[:-4]+'.meta'
+    if verbose: print "* Fetching "+metaurl
+    fmeta = urllib2.urlopen(metaurl)
+    return fenc,fmeta
+  except urllib2.HTTPError,e:
+    if e.code==401: return fetch2_auth(url,tmpdir)
+    else: raise
+
+def fetch(url,tmpdir):
+  """
+  Fetch file from http. Use auth if needed
+  """
+  if not url.endswith('.enc'):
+    raise RuntimeError('Url should end with .enc')
+
+  fenc,fmeta = fetch2(url,tmpdir)
+
+  meta = json.load(fmeta)
+  fmeta.close()
+
+  fname = os.path.basename(url)
+  encfile = os.path.join(tmpdir,fname)
+  f=open(encfile,'w')
+  shutil.copyfileobj(fenc,f)
+  f.close()
+  return encfile,meta
+
+def run_cmd(cmd,stdin):
+  if verbose: print "* Running: %s"%(' '.join(cmd))
+  p = subprocess.Popen(cmd,stdin=subprocess.PIPE)
+  p.communicate(input=stdin)
+  p.wait()
+  if p.returncode!=0: raise RuntimeError("Command failed: %s"%(" ".join(cmd)))
+
+def decfile(encfile,plain,meta=None):
+  """
+  Decrypt file encfile to file plain.
+  """
+  if meta is None:
+    if not encfile.endswith('.enc'):
+      raise RuntimeError("Encrypted file name should end with .enc")
+    fmeta = open(encfile[:-4]+'.meta','r')
+    meta = json.load(fmeta)
+    fmeta.close()
+  key_fp = meta['key']
+  salt = base64.b64decode(meta['salt'])
+  password = pwd_256(key_fp,salt)
+  cmd = ['/usr/bin/openssl','aes-256-cbc','-d','-in',encfile,'-out',plain,'-pass','stdin']
+  run_cmd(cmd,password)
+
+def encfile(plain,encpath):
+  """
+  Encrypt file plain and save .env and .meta files into dir encpath
+  """
+  if not os.path.isfile(plain):
+    raise RuntimeError('File %s does not exist.'%(plain,))
+  fname = os.path.basename(plain)
+  base = os.path.join(encpath,fname)
+  enc = base+'.enc'
+  salt = os.urandom(32)
+  # @TODO: choose key with param
+  key_fp = default_key_fp
+  fmeta = open(base+'.meta','w')
+  json.dump({'key':key_fp,'salt':base64.b64encode(salt)},fmeta)
+  fmeta.close()
+  password = pwd_256(key_fp,salt)
+  cmd = ['/usr/bin/openssl','aes-256-cbc','-in',plain,'-out',enc,'-pass','stdin']
+  run_cmd(cmd,password)
+
+def usage():
+  print """
+  usage:
+
+     %(prog)s e[ncrypt] /some/file /encfile/destination/dir
+        will create
+          /encfile/destination/dir/file.enc  - encrypted file
+          /encfile/destination/dir/file.meta - metadata needed for decryption
+
+     %(prog)s d[ecrypt] /some/file.enc /plainfile/destination/dir
+        will use
+          /some/file.enc
+          /some/file.meta
+        to create
+          /plainfile/destination/dir/file
+
+     %(prog)s d[ecrypt] http://some/encryptedfile.enc /plainfile/destination/dir
+       same as the previous command but will fetch .enc and .meta files from http
+
+     %(prog)s r[un]     /some/cfg_file.enc some_command -c FILE
+       cfg_file.enc will be decrypted into secure temporary directory (see privtmp in the source)
+       and command will be called with FILE replaced with this decrypted file path
+       - e.g. some_command -c /tmp/safseXSdc/cfg_file
+
+"""%{'prog':os.path.basename(sys.argv[0])}
+  sys.exit(1)
+
+def decfile_uri(encfile,dstdir,tmpdir=None):
+  """
+  Decrypt file encfile.
+
+  encfile can be file or http uri (without parameters - it MUST end with .enc)
+  """
+  if not encfile.endswith('.enc'):
+    raise RuntimeError("Encrypted file name should end with .enc")
+  if not os.path.isdir(dstdir):
+    raise RuntimeError("%s is not a directory"%(dstdir,))
+  meta = None
+  tmpdir2 = None
+  try:
+    if encfile.startswith('http'):
+      if tmpdir is None:
+        tmpdir = tempfile.mkdtemp(dir=privtmp)
+        tmpdir2 = tmpdir
+      encfile,meta = fetch(encfile,tmpdir)
+    # fortunatelly, basename works for http urls too (when not using params)
+    fname = os.path.basename(encfile)[:-4]
+    plainfile = os.path.join(dstdir,fname)
+    decfile(encfile,plainfile,meta=meta)
+    return plainfile
+  finally:
+    if tmpdir2 is not None: shutil.rmtree(tmpdir)
+
+def cmd_run(argv):
+  if len(argv)<2: usage()
+  encfile = argv[0]
+  result = 1
+  tmpdir = tempfile.mkdtemp(dir=privtmp)
+  try:
+    cfgfile = decfile_uri(encfile,tmpdir,tmpdir=tmpdir)
+    args = map(lambda s: s.replace('FILE',cfgfile),argv[1:])
+
+    # we will remove the decrypted file soon after the command is run
+    def rmcfg():
+      time.sleep(rm_wait)
+      if verbose: print "* Removing decrypted cfg file"
+      if os.path.exists(tmpdir): shutil.rmtree(tmpdir)
+    rmp = multiprocessing.Process(target=rmcfg, args=())
+    rmp.start()
+
+    # run the command
+    if verbose: print "* Running: %s"%(' '.join(args))
+    result = subprocess.call(args)
+    if verbose: print "* Command exited with:", result
+
+    # if rmcfg is still sleeping, terminate it!
+    rmp.terminate()
+  except:
+    raise
+  finally:
+    # make yourself supershure tempdir is deleted...
+    if os.path.exists(tmpdir): shutil.rmtree(tmpdir)
+  # return the same code as the called command
+  sys.exit(result)
+
+def cmd_enc(argv):
+  if len(argv)<2: usage()
+  encfile(argv[0],argv[1])
+  sys.exit(0)
+
+def cmd_dec(argv):
+  if len(argv)!=2: usage()
+  decfile_uri(argv[0],argv[1])
+  sys.exit(0)
+
+def main():
+  if len(sys.argv)<3: usage()
+  if 'encrypt'.startswith(sys.argv[1]):
+    cmd_enc(sys.argv[2:])
+  elif 'decrypt'.startswith(sys.argv[1]):
+    cmd_dec(sys.argv[2:])
+  elif 'run'.startswith(sys.argv[1]):
+    cmd_run(sys.argv[2:])
+  else:
+    usage()
+
+if __name__=='__main__':
+  try:
+    main()
+  except KeyboardInterrupt:
+    pass
+  except Exception,e:
+    print "\nERROR:",e
